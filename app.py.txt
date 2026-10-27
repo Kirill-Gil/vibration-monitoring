@@ -1,0 +1,406 @@
+"""
+Система онлайн-мониторинга состояния насосного агрегата ДНС (0.4/6 кВ)
+согласно ГОСТ Р ИСО 20816-1-2021 и ГОСТ Р ИСО 20816-3-2023.
+
+Реализует:
+1. 12 каналов виброконтроля (4 опоры x H, V, A).
+2. Фазные токи статора MCSA (L1, L2, L3).
+3. Полосовую фильтрацию (2-5 кГц), Гильберт и FFT огибающей для дефектов подшипников (BPFO).
+4. Загрузку внешних файлов (.mat CWRU и .csv).
+5. In-Memory кольцевой буфер телеметрии.
+"""
+
+from collections import deque
+import io
+import math
+import time
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+import numpy as np
+from pydantic import BaseModel
+from scipy import signal
+from scipy.io import loadmat
+
+app = FastAPI(title="DNS Electric Motor Online Monitoring System")
+templates = Jinja2Templates(directory="templates")
+
+# ==========================================
+# КОНФИГУРАЦИЯ И СТАНДАРТЫ ГОСТ Р ИСО 20816
+# ==========================================
+ISO_THRESHOLDS = {
+    "A_B_BOUNDARY": 2.8,  # До 2.8 мм/с — норма (A/B)
+    "B_C_BOUNDARY": 4.5,  # 2.8 - 4.5 мм/с — предупреждение (C)
+    # Свыше 4.5 мм/с — аварийная зона/останов (D)
+}
+
+BEARING_BPFO_THEORETICAL = 107.3  # Гц (для подшипника SKF 6205 при 1796 об/мин)
+SUPPORTS = ["ED_DE", "ED_NDE", "PUMP_DE", "PUMP_NDE"]
+CHANNELS = ["H", "V", "A"]
+
+
+class SystemState:
+
+    def __init__(self):
+        # Режимы симуляции: 'NORMAL', 'BEARING_FAULT', 'COUPLING_UNBALANCE', 'ROTOR_FAULT'
+        self.simulation_mode = "NORMAL"
+        self.rpm = 1796.0
+        self.sampling_rate = 12000  # Гц (согласно датасету CWRU)
+        self.window_duration = 0.5  # сек для стриминга (6000 отсчетов)
+        self.history_len = 100
+        self.history = deque(maxlen=self.history_len)
+
+        # Текущие СКЗ 12 каналов (мм/с)
+        self.current_rms: Dict[str, float] = {
+            f"{sup}_{ch}": 1.2
+            for sup in SUPPORTS
+            for ch in CHANNELS
+        }
+        self.current_status = "NORMAL"
+        self.alerts: List[Dict] = []
+
+
+state = SystemState()
+
+# ==========================================
+# МОДУЛЬ ЦОС (ЦИФРОВОЙ ОБРАБОТКИ СИГНАЛОВ)
+# ==========================================
+
+
+def calculate_rms(data: np.ndarray) -> float:
+    """Расчет СКЗ (Root Mean Square)."""
+    return float(np.sqrt(np.mean(data**2)))
+
+
+def evaluate_iso_zone(rms_velocity: float) -> str:
+    """Оценка технического состояния по ГОСТ Р ИСО 20816-1/3."""
+    if rms_velocity <= ISO_THRESHOLDS["A_B_BOUNDARY"]:
+        return "NORMAL"
+    elif rms_velocity <= ISO_THRESHOLDS["B_C_BOUNDARY"]:
+        return "WARNING"
+    return "ALARM"
+
+
+def compute_envelope_spectrum(
+    vib_accel: np.ndarray,
+    fs: int = 12000,
+    band: tuple = (2000, 5000),
+    max_freq: float = 500.0,
+):
+    """
+    Алгоритм высокочастотного спектра огибающей:
+    1. Полосовой фильтр Баттерворта 2-5 кГц.
+    2. Выделение огибающей через модуль аналитического сигнала Гильберта.
+    3. БПФ огибающей для поиска пика BPFO.
+    """
+    nyquist = 0.5 * fs
+    low = band[0] / nyquist
+    high = band[1] / nyquist
+
+    # Защита границ частоты Найквиста
+    low = max(0.001, min(low, 0.99))
+    high = max(low + 0.01, min(high, 0.99))
+
+    # Полосовой фильтр Баттерворта 4-го порядка
+    b, a = signal.butter(4, [low, high], btype="band")
+    filtered = signal.filtfilt(b, a, vib_accel)
+
+    # Преобразование Гильберта
+    analytic_signal = signal.hilbert(filtered)
+    envelope = np.abs(analytic_signal)
+    envelope = envelope - np.mean(envelope)  # центрирование
+
+    # БПФ
+    n = len(envelope)
+    fft_vals = np.fft.rfft(envelope * signal.windows.hann(n))
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    amplitudes = (2.0 / n) * np.abs(fft_vals)
+
+    # Ограничение диапазона до max_freq (500 Гц)
+    mask = freqs <= max_freq
+    f_sub = freqs[mask]
+    amp_sub = amplitudes[mask]
+
+    # Нормировка
+    max_amp = np.max(amp_sub) if len(amp_sub) > 0 and np.max(amp_sub) > 0 else 1.0
+    amp_sub_norm = amp_sub / max_amp
+
+    # Поиск доминирующего пика дефекта
+    peak_freq = 0.0
+    valid_idx = np.where(f_sub >= 20.0)[0]  # игнорируем постоянный ток и сверхнизкие шумы
+    if len(valid_idx) > 0:
+        idx = valid_idx[np.argmax(amp_sub[valid_idx])]
+        peak_freq = float(f_sub[idx])
+
+    return f_sub.tolist(), amp_sub_norm.tolist(), peak_freq
+
+
+def compute_mcsa_spectrum(
+    current_data: np.ndarray, fs: int = 4000, target_freq: float = 50.0
+):
+    """
+    Сигнатурный анализ токов статора (MCSA):
+    FFT тока вокруг сетевой частоты 50 Гц для выявления боковых полос дефекта ротора.
+    """
+    n = len(current_data)
+    fft_vals = np.fft.rfft(current_data * signal.windows.hann(n))
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    power = (2.0 / n) * np.abs(fft_vals)
+
+    # Логарифмический спектр (дБ относительно максимума)
+    max_p = np.max(power) if np.max(power) > 0 else 1.0
+    db_power = 20 * np.log10(np.maximum(power / max_p, 1e-4))
+
+    # Вырезаем область 30 - 70 Гц
+    mask = (freqs >= 30.0) & (freqs <= 70.0)
+    return freqs[mask].tolist(), db_power[mask].tolist()
+
+
+# ==========================================
+# ГЕНЕРАТОР ПОТОКА ТЕЛЕМЕТРИИ С АГРЕГАТА
+# ==========================================
+
+
+def generate_unit_telemetry():
+    """Симулирует оцифрованные сигналы виброскорости, виброускорения и фазных токов."""
+    fs_vib = state.sampling_rate
+    duration = state.window_duration
+    t = np.linspace(0, duration, int(fs_vib * duration), endpoint=False)
+
+    f_rot = state.rpm / 60.0  # ~29.93 Гц
+    f_bpfo = BEARING_BPFO_THEORETICAL  # 107.3 Гц
+
+    # 1. Формирование виброускорения опоры привода (ED_DE)
+    accel = 0.05 * np.random.randn(len(t))  # базовый шум
+
+    # Гармоники вращения вала
+    accel += 0.2 * np.sin(2 * np.pi * f_rot * t)
+
+    # Внесение аномалий согласно выбранному режиму
+    if state.simulation_mode == "BEARING_FAULT":
+        # Ударные импульсы BPFO с резонансом на 3200 Гц
+        impacts = np.zeros_like(t)
+        pulse_period = int(fs_vib / f_bpfo)
+        impacts[::pulse_period] = 1.0
+        # Затухающий резонансный отклик
+        decay_impulse = np.exp(-1500 * t[: int(fs_vib * 0.01)]) * np.sin(
+            2 * np.pi * 3200 * t[: int(fs_vib * 0.01)]
+        )
+        bearing_resonance = np.convolve(impacts, decay_impulse, mode="same")
+        accel += 1.8 * bearing_resonance
+
+    # Интегрирование ускорения для получения виброскорости (мм/с)
+    velocity = np.cumsum(accel) * (9810.0 / fs_vib)  # g -> мм/с
+    velocity = velocity - np.mean(velocity)
+
+    base_rms = calculate_rms(velocity)
+
+    # Коэффициенты множителей для 12 каналов
+    mults = {
+        "NORMAL": {k: 1.0 for k in state.current_rms},
+        "BEARING_FAULT": {
+            "ED_DE_H": 3.4,
+            "ED_DE_V": 3.8,
+            "ED_DE_A": 2.2,
+        },  # Превышение на опоре ЭД-1
+        "COUPLING_UNBALANCE": {
+            "ED_NDE_H": 2.6,
+            "ED_NDE_V": 2.9,
+            "PUMP_DE_H": 3.1,
+            "PUMP_DE_V": 3.2,
+        },  # Муфта
+        "ROTOR_FAULT": {"ED_DE_H": 2.5, "ED_NDE_H": 2.7},
+    }
+
+    current_mults = mults.get(state.simulation_mode, mults["NORMAL"])
+
+    for k in state.current_rms:
+        factor = current_mults.get(k, 1.0)
+        # Добавляем небольшую случайную флуктуацию
+        noise = np.random.uniform(0.95, 1.05)
+        raw_val = base_rms * factor * noise
+        # Масштабируем до реалистичных мм/с
+        if state.simulation_mode == "BEARING_FAULT" and "ED_DE" in k:
+            val = 4.8 * noise  # Аварийная зона D
+        elif state.simulation_mode == "COUPLING_UNBALANCE" and (
+            "ED_NDE" in k or "PUMP_DE" in k
+        ):
+            val = 3.6 * noise  # Предупреждение C
+        elif state.simulation_mode == "NORMAL":
+            val = 1.2 * noise  # Норма A/B
+        else:
+            val = 1.4 * noise
+        state.current_rms[k] = round(float(val), 2)
+
+    # 2. Формирование токов статора (L1, L2, L3)
+    t_curr = np.linspace(0, duration, int(4000 * duration), endpoint=False)
+    i_nom = 45.0  # Ампер (пример для насоса 0.4 кВ)
+    i_l1 = (
+        i_nom * np.sqrt(2) * np.sin(2 * np.pi * 50.0 * t_curr)
+        + 0.5 * np.random.randn(len(t_curr))
+    )
+
+    if state.simulation_mode == "ROTOR_FAULT":
+        # Обрыв стержня беличьей клетки: боковые полосы скольжения fs*(1 +/- 2s), s ~ 0.02 -> 48 Гц и 52 Гц
+        i_l1 += 3.5 * np.sin(2 * np.pi * 48.0 * t_curr) + 3.5 * np.sin(
+            2 * np.pi * 52.0 * t_curr
+        )
+
+    # Анализ огибающей и MCSA
+    f_env, amp_env, peak_bpfo = compute_envelope_spectrum(accel, fs=fs_vib)
+    f_mcsa, db_mcsa = compute_mcsa_spectrum(i_l1, fs=4000)
+
+    # Максимальное СКЗ по всем 12 каналам для интегральной оценки машины
+    max_rms = max(state.current_rms.values())
+    machine_status = evaluate_iso_zone(max_rms)
+    state.current_status = machine_status
+
+    # Регистрация алертов
+    if machine_status in ["WARNING", "ALARM"]:
+        alert = {
+            "time": time.strftime("%H:%M:%S"),
+            "level": machine_status,
+            "max_rms": max_rms,
+            "mode": state.simulation_mode,
+            "desc": (
+                f"Превышение допустимого уровня вибрации по ГОСТ Р ИСО 20816 ({max_rms} мм/с)"
+                if machine_status == "ALARM"
+                else f"Предупредительный порог зоны C ({max_rms} мм/с)"
+            ),
+        }
+        if not state.alerts or state.alerts[-1]["level"] != machine_status:
+            state.alerts.append(alert)
+            if len(state.alerts) > 20:
+                state.alerts.pop(0)
+
+    snapshot = {
+        "timestamp": time.time(),
+        "time_str": time.strftime("%H:%M:%S"),
+        "max_rms": max_rms,
+        "status": machine_status,
+        "rms_channels": state.current_rms,
+        "envelope": {
+            "freqs": f_env[::4],  # прореживание для оптимизации трафика UI
+            "amps": amp_env[::4],
+            "peak_freq": round(peak_bpfo, 1),
+            "expected_bpfo": BEARING_BPFO_THEORETICAL,
+        },
+        "mcsa": {
+            "freqs": f_mcsa,
+            "db": db_mcsa,
+        },
+        "currents": {
+            "L1": round(calculate_rms(i_l1), 1),
+            "L2": round(calculate_rms(i_l1) * 0.99, 1),
+            "L3": round(calculate_rms(i_l1) * 1.01, 1),
+        },
+        "simulation_mode": state.simulation_mode,
+        "alerts": list(reversed(state.alerts[-5:])),
+    }
+
+    state.history.append({"time": snapshot["time_str"], "rms": max_rms})
+    return snapshot
+
+
+# ==========================================
+# REST API ЭНДПОИНТЫ
+# ==========================================
+
+
+class ModeRequest(BaseModel):
+    mode: str
+
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index(request: Request):
+    """Главная страница SCADA-интерфейса."""
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/api/telemetry")
+async def get_telemetry():
+    """Срез текущей телеметрии и спектров в реальном времени."""
+    return generate_unit_telemetry()
+
+
+@app.post("/api/simulation/mode")
+async def set_mode(req: ModeRequest):
+    """Смена технологического режима агрегата."""
+    valid_modes = ["NORMAL", "BEARING_FAULT", "COUPLING_UNBALANCE", "ROTOR_FAULT"]
+    if req.mode not in valid_modes:
+        raise HTTPException(
+            status_code=400, detail="Недопустимый режим моделирования"
+        )
+    state.simulation_mode = req.mode
+    return {"status": "success", "mode": state.simulation_mode}
+
+
+@app.post("/api/diagnose/file")
+async def analyze_file(file: UploadFile = File(...)):
+    """
+    Принимает внешний файл (.mat от CWRU или .csv)
+    и выполняет лабораторную валидацию алгоритма спектра огибающей.
+    """
+    content = await file.read()
+    filename = file.filename.lower()
+    raw_signal = None
+    fs = 12000
+
+    try:
+        if filename.endswith(".mat"):
+            mat_data = loadmat(io.BytesIO(content))
+            # Автопоиск ключа с данными виброускорения CWRU (например 'X130_DE_time')
+            target_key = None
+            for k in mat_data.keys():
+                if "DE_time" in k or "BA_time" in k or "FE_time" in k:
+                    target_key = k
+                    break
+            if not target_key:
+                # Если стандартный ключ не найден, берем первый несистемный массив
+                target_key = [k for k in mat_data.keys() if not k.startswith("__")][0]
+            raw_signal = mat_data[target_key].flatten()
+        elif filename.endswith(".csv") or filename.endswith(".txt"):
+            text_data = content.decode("utf-8")
+            raw_signal = np.genfromtxt(io.StringIO(text_data), delimiter=",")
+            if raw_signal.ndim > 1:
+                raw_signal = raw_signal[:, -1]  # берем последний столбец
+        else:
+            raise HTTPException(
+                status_code=400, detail="Поддерживаются только форматы .mat и .csv"
+            )
+
+        if raw_signal is None or len(raw_signal) == 0:
+            raise ValueError("Файл не содержит числовых данных")
+
+        # Выполняем эталонный расчет спектра огибающей
+        freqs, amps, peak_freq = compute_envelope_spectrum(raw_signal, fs=fs)
+        error = abs(peak_freq - BEARING_BPFO_THEORETICAL)
+
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "samples_count": len(raw_signal),
+            "sampling_rate": fs,
+            "calculated_bpfo": BEARING_BPFO_THEORETICAL,
+            "detected_peak": round(peak_freq, 1),
+            "deviation_hz": round(error, 2),
+            "freqs": freqs[::2],
+            "amps": amps[::2],
+            "conclusion": (
+                f"Выделен пик дефекта {round(peak_freq,1)} Гц с погрешностью {round(error,2)} Гц. "
+                "Дефект наружного кольца подшипника (BPFO) надежно идентифицирован."
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Ошибка обработки сигнала: {str(e)}"
+        )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

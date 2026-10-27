@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Онлайн-мониторинг электродвигателей 0.4-6 кВ | ДНС Нефтедобыча</title>
+    <!-- Подключение Plotly.js -->
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        :root {
+            --gpn-blue: #003366;
+            --gpn-cyan: #0078D2;
+            --gpn-light: #F4F6F9;
+            --gpn-dark: #1E293B;
+            --status-green: #10B981;
+            --status-yellow: #F59E0B;
+            --status-red: #EF4444;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', -apple-system, sans-serif; }
+        body { background-color: var(--gpn-light); color: var(--gpn-dark); }
+        
+        header {
+            background: linear-gradient(90deg, var(--gpn-blue) 0%, var(--gpn-cyan) 100%);
+            color: white; padding: 16px 28px;
+            display: flex; justify-content: space-between; align-items: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .header-title h1 { font-size: 20px; font-weight: 700; letter-spacing: 0.5px; }
+        .header-title p { font-size: 13px; opacity: 0.85; }
+        .unit-badge { background: rgba(255,255,255,0.2); padding: 6px 14px; border-radius: 20px; font-weight: 600; font-size: 14px; }
+
+        .container { max-width: 1440px; margin: 20px auto; padding: 0 20px; display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+        .full-width { grid-column: span 2; }
+
+        .card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--gpn-light); padding-bottom: 12px; margin-bottom: 16px; }
+        .card-header h2 { font-size: 16px; color: var(--gpn-blue); text-transform: uppercase; font-weight: 700; }
+
+        /* Мнемосхема агрегата */
+        .mnemo-container {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-top: 15px;
+            background: #EBF1F6; padding: 20px; border-radius: 8px; text-align: center;
+        }
+        .support-node {
+            background: white; border-radius: 8px; padding: 14px; border-top: 4px solid var(--gpn-cyan);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+        }
+        .support-node.alarm { border-top-color: var(--status-red); }
+        .support-node.warning { border-top-color: var(--status-yellow); }
+        .support-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; color: var(--gpn-blue); }
+        .channel-val { display: flex; justify-content: space-between; font-size: 12px; margin: 4px 0; }
+        
+        /* Статусы ГОСТ */
+        .status-pill {
+            display: inline-block; padding: 6px 16px; border-radius: 30px; font-weight: 700; font-size: 13px; color: white;
+        }
+        .status-pill.NORMAL { background-color: var(--status-green); }
+        .status-pill.WARNING { background-color: var(--status-yellow); }
+        .status-pill.ALARM { background-color: var(--status-red); }
+
+        /* Панель симулятора и тестов */
+        .control-panel { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; }
+        .btn {
+            background: white; border: 1.5px solid var(--gpn-cyan); color: var(--gpn-cyan);
+            padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s;
+        }
+        .btn:hover, .btn.active { background: var(--gpn-cyan); color: white; }
+        .btn.danger { border-color: var(--status-red); color: var(--status-red); }
+        .btn.danger:hover, .btn.danger.active { background: var(--status-red); color: white; }
+
+        /* Таблица алертов */
+        .alert-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .alert-table th, .alert-table td { padding: 10px; text-align: left; border-bottom: 1px solid #E2E8F0; }
+        .alert-table th { background: #F8FAFC; color: var(--gpn-blue); font-weight: 600; }
+
+        /* Блок верификации CWRU */
+        .upload-box {
+            border: 2px dashed #CBD5E1; padding: 20px; border-radius: 8px; text-align: center;
+            background: #FAFAFA; cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="header-title">
+        <h1>СИСТЕМА ОНЛАЙН-МОНИТОРИНГА ЭЛЕКТРОДВИГАТЕЛЕЙ ДНС (0.4 / 6 кВ)</h1>
+        <p>ПрЭО «МН» | Интеллектуальный контроль вибросостояния и токов статора (ГОСТ Р ИСО 20816)</p>
+    </div>
+    <div class="unit-badge">АГРЕГАТ: НА-102 (6 кВ / 630 кВт)</div>
+</header>
+
+<div class="container">
+    
+    <!-- Главная мнемосхема и статус агрегата -->
+    <div class="card full-width">
+        <div class="card-header">
+            <h2>Мнемосхема агрегата «Электродвигатель — Мягкая муфта — Насос» (12 каналов ГОСТ)</h2>
+            <div id="general-status" class="status-pill NORMAL">ЗОНА A/B: НОРМА</div>
+        </div>
+
+        <div class="control-panel">
+            <span style="align-self: center; font-weight: 600; font-size: 13px; margin-right: 8px;">Моделирование дефектов:</span>
+            <button class="btn active" onclick="setMode('NORMAL', this)">Штатный режим</button>
+            <button class="btn danger" onclick="setMode('BEARING_FAULT', this)">Дефект подшипника (BPFO)</button>
+            <button class="btn" onclick="setMode('COUPLING_UNBALANCE', this)">Перекос муфты</button>
+            <button class="btn" onclick="setMode('ROTOR_FAULT', this)">Обрыв стержней ротора (MCSA)</button>
+        </div>
+
+        <!-- 4 опорные точки -->
+        <div class="mnemo-container">
+            <div class="support-node" id="node-ED_NDE">
+                <div class="support-title">ОПОРА 1: ЭД (NDE)</div>
+                <div class="channel-val"><span>Гориз (H):</span><b id="val-ED_NDE_H">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Верт (V):</span><b id="val-ED_NDE_V">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Осевой (A):</span><b id="val-ED_NDE_A">0.0</b> мм/с</div>
+            </div>
+            <div class="support-node" id="node-ED_DE">
+                <div class="support-title">ОПОРА 2: ЭД (DE) [Привод]</div>
+                <div class="channel-val"><span>Гориз (H):</span><b id="val-ED_DE_H">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Верт (V):</span><b id="val-ED_DE_V">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Осевой (A):</span><b id="val-ED_DE_A">0.0</b> мм/с</div>
+            </div>
+            <div class="support-node" id="node-PUMP_DE">
+                <div class="support-title">ОПОРА 3: НАСОС (DE)</div>
+                <div class="channel-val"><span>Гориз (H):</span><b id="val-PUMP_DE_H">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Верт (V):</span><b id="val-PUMP_DE_V">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Осевой (A):</span><b id="val-PUMP_DE_A">0.0</b> мм/с</div>
+            </div>
+            <div class="support-node" id="node-PUMP_NDE">
+                <div class="support-title">ОПОРА 4: НАСОС (NDE)</div>
+                <div class="channel-val"><span>Гориз (H):</span><b id="val-PUMP_NDE_H">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Верт (V):</span><b id="val-PUMP_NDE_V">0.0</b> мм/с</div>
+                <div class="channel-val"><span>Осевой (A):</span><b id="val-PUMP_NDE_A">0.0</b> мм/с</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- График спектра огибающей FFT (Подшипники) -->
+    <div class="card">
+        <div class="card-header">
+            <h2>Спектр огибающей Гильберта (Опора 2 DE, полоса 2-5 кГц)</h2>
+            <span style="font-size: 13px; font-weight: 600;" id="bpfo-peak-label">Пик: 0.0 Гц</span>
+        </div>
+        <div id="envelope-chart" style="height: 320px;"></div>
+    </div>
+
+    <!-- График MCSA спектра токов статора -->
+    <div class="card">
+        <div class="card-header">
+            <h2>Токовый спектр MCSA (Контроль ротора вокруг 50 Гц)</h2>
+            <span style="font-size: 13px; font-weight: 600;" id="currents-label">Iном = 45.0 А</span>
+        </div>
+        <div id="mcsa-chart" style="height: 320px;"></div>
+    </div>
+
+    <!-- Журнал событий и алертов -->
+    <div class="card">
+        <div class="card-header">
+            <h2>Журнал предупреждений (Превышение порогов ГОСТ)</h2>
+        </div>
+        <table class="alert-table">
+            <thead>
+                <tr>
+                    <th>Время</th>
+                    <th>Зона</th>
+                    <th>СКЗ (мм/с)</th>
+                    <th>Описание инцидента</th>
+                </tr>
+            </thead>
+            <tbody id="alert-tbody">
+                <tr><td colspan="4" style="text-align: center; color: #94A3B8;">Событий не зафиксировано</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Верификация внешних файлов CWRU -->
+    <div class="card">
+        <div class="card-header">
+            <h2>Лабораторная верификация алгоритма (CWRU .mat / .csv)</h2>
+        </div>
+        <div class="upload-box" onclick="document.getElementById('file-input').click()">
+            <p>Нажмите для загрузки файла <b>130.mat</b> или <b>.csv</b></p>
+            <input type="file" id="file-input" style="display: none;" onchange="uploadFile(this)">
+        </div>
+        <div id="file-result" style="margin-top: 15px; font-size: 13px; line-height: 1.6; display: none;"></div>
+    </div>
+
+</div>
+
+<script>
+    // Инициализация графиков Plotly
+    Plotly.newPlot('envelope-chart', [{
+        x: [0], y: [0], type: 'scatter', mode: 'lines',
+        line: { color: '#0078D2', width: 1.5 }, name: 'Спектр огибающей'
+    }], {
+        margin: { t: 20, r: 20, l: 40, b: 40 },
+        xaxis: { title: 'Частота, Гц', range: [0, 500] },
+        yaxis: { title: 'Норм. амплитуда', range: [0, 1.1] }
+    });
+
+    Plotly.newPlot('mcsa-chart', [{
+        x: [0], y: [0], type: 'scatter', mode: 'lines',
+        line: { color: '#10B981', width: 1.5 }, name: 'MCSA Спектр'
+    }], {
+        margin: { t: 20, r: 20, l: 40, b: 40 },
+        xaxis: { title: 'Частота, Гц', range: [30, 70] },
+        yaxis: { title: 'Мощность, дБ', range: [-60, 5] }
+    });
+
+    async function setMode(mode, btn) {
+        document.querySelectorAll('.control-panel .btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        await fetch('/api/simulation/mode', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ mode: mode })
+        });
+    }
+
+    async function updateDashboard() {
+        try {
+            const res = await fetch('/api/telemetry');
+            const data = await res.json();
+
+            // Обновление общего статуса
+            const statusElem = document.getElementById('general-status');
+            statusElem.className = 'status-pill ' + data.status;
+            if (data.status === 'NORMAL') statusElem.innerText = `ЗОНА A/B: НОРМА (${data.max_rms} мм/с)`;
+            else if (data.status === 'WARNING') statusElem.innerText = `ЗОНА C: ПРЕДУПРЕЖДЕНИЕ (${data.max_rms} мм/с)`;
+            else statusElem.innerText = `ЗОНА D: АВАРИЯ / ОСТАНОВ (${data.max_rms} мм/с)`;
+
+            // Обновление 12 каналов мнемосхемы
+            for (const [key, val] of Object.entries(data.rms_channels)) {
+                const el = document.getElementById('val-' + key);
+                if (el) el.innerText = val.toFixed(1);
+            }
+
+            // Подсветка опор
+            ['ED_DE', 'ED_NDE', 'PUMP_DE', 'PUMP_NDE'].forEach(sup => {
+                const node = document.getElementById('node-' + sup);
+                const supMax = Math.max(
+                    data.rms_channels[`${sup}_H`],
+                    data.rms_channels[`${sup}_V`],
+                    data.rms_channels[`${sup}_A`]
+                );
+                node.classList.remove('warning', 'alarm');
+                if (supMax > 4.5) node.classList.add('alarm');
+                else if (supMax > 2.8) node.classList.add('warning');
+            });
+
+            // Обновление графика огибающей
+            Plotly.update('envelope-chart', {
+                x: [data.envelope.freqs],
+                y: [data.envelope.amps]
+            });
+            document.getElementById('bpfo-peak-label').innerText = 
+                `Пик: ${data.envelope.peak_freq} Гц (Расчет BPFO: ${data.envelope.expected_bpfo} Гц)`;
+
+            // Обновление MCSA
+            Plotly.update('mcsa-chart', {
+                x: [data.mcsa.freqs],
+                y: [data.mcsa.db]
+            });
+            document.getElementById('currents-label').innerText = 
+                `Фазы: L1=${data.currents.L1}A, L2=${data.currents.L2}A, L3=${data.currents.L3}A`;
+
+            // Обновление алертов
+            if (data.alerts && data.alerts.length > 0) {
+                let html = '';
+                data.alerts.forEach(a => {
+                    const color = a.level === 'ALARM' ? 'var(--status-red)' : 'var(--status-yellow)';
+                    html += `<tr>
+                        <td>${a.time}</td>
+                        <td style="color:${color}; font-weight:700;">${a.level}</td>
+                        <td>${a.max_rms.toFixed(1)}</td>
+                        <td>${a.desc}</td>
+                    </tr>`;
+                });
+                document.getElementById('alert-tbody').innerHTML = html;
+            }
+
+        } catch (e) {
+            console.error('Ошибка обновления телеметрии:', e);
+        }
+    }
+
+    async function uploadFile(input) {
+        if (!input.files || input.files.length === 0) return;
+        const formData = new FormData();
+        formData.append('file', input.files[0]);
+
+        const resBox = document.getElementById('file-result');
+        resBox.style.display = 'block';
+        resBox.innerHTML = '<i>Выполняется преобразование Гильберта и спектральный анализ...</i>';
+
+        try {
+            const resp = await fetch('/api/diagnose/file', {
+                method: 'POST',
+                body: formData
+            });
+            const res = await resp.json();
+            if (res.status === 'success') {
+                resBox.innerHTML = `
+                    <div style="background: #ECFDF5; border: 1px solid #10B981; padding: 12px; border-radius: 6px;">
+                        <b>Результат верификации (${res.filename}):</b><br>
+                        • Отсчетов: ${res.samples_count} (Fs = ${res.sampling_rate} Гц)<br>
+                        • Расчетная частота дефекта (BPFO): <b>${res.calculated_bpfo} Гц</b><br>
+                        • Локализованный пик алгоритма: <b style="color: #0078D2;">${res.detected_peak} Гц</b><br>
+                        • Абсолютная погрешность: <b>${res.deviation_hz} Гц</b><br>
+                        <i>${res.conclusion}</i>
+                    </div>
+                `;
+            } else {
+                resBox.innerHTML = `<span style="color:red">Ошибка: ${res.detail}</span>`;
+            }
+        } catch (err) {
+            resBox.innerHTML = `<span style="color:red">Сбой загрузки: ${err.message}</span>`;
+        }
+    }
+
+    // Запуск цикла опроса телеметрии раз в секунду
+    setInterval(updateDashboard, 1000);
+    updateDashboard();
+</script>
+
+</body>
+</html>
